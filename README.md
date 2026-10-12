@@ -7,10 +7,7 @@ leader after receiving a strict majority of the configured members' votes.
 
 The gRPC service has `RequestVote` and a small `Heartbeat` RPC. The latter keeps
 followers from starting new elections and reports the leader ID. It carries no
-log information. **AppendEntries, replication, the key-value store, and CAS
-locks are not implemented.** When adding replication, replace this temporary
-heartbeat with AppendEntries (including empty AppendEntries heartbeats).
-Election rules follow [the Raft paper, section 5.2 and figure 2](https://raft.github.io/raft.pdf).
+log information.
 
 Run locally with Rust 1.88 or newer (a vendored `protoc` is used automatically):
 
@@ -26,15 +23,18 @@ curl http://127.0.0.1:8081/api/status
 The single REST endpoint, `GET /api/status`, returns a local snapshot:
 
 ```json
-{"node_id":1,"role":"follower","current_term":4,"leader_id":2}
+{
+    "node_id": 1,
+    "role": "follower",
+    "current_term": 4,
+    "leader_id": 2
+}
 ```
 
 Roles are `follower`, `candidate`, or `leader`. `leader_id` is `null` until the
 node wins an election or hears a current leader's heartbeat. This status is
 local knowledge: during a partition an isolated old leader can still report
-`leader` while the majority elects a leader in a higher term. It is not a lease
-or permission to mutate shared data. Future writes and locks must use quorum
-commit and fencing; a lock cannot safely rely on this endpoint alone.
+`leader` while the majority elects a leader in a higher term.
 
 YAML configuration contains all members, **including the local node**. Example:
 
@@ -96,64 +96,15 @@ prepares data directories for the runtime UID. Nodes start only after it exits
 successfully. Compose container names `<project>-raft-<index>` provide individual
 peer addresses; each entrypoint matches its IP to these DNS names to determine
 its stable node ID. The project name can be changed with `docker compose -p ...`
-or `COMPOSE_PROJECT_NAME`. This deployment targets Docker Compose on one Docker
-host; it does not use Swarm task identities or `docker stack deploy`.
+or `COMPOSE_PROJECT_NAME`.
 
 Each node uses `/data/node-<id>` in the state volume. HTTP is published on a
 separate automatically assigned loopback port for every replica, and gRPC stays
 on the Compose network. Health checks report whether the REST server responds,
-including on a follower or a node without a quorum. Both transports use
-plaintext and assume a trusted cluster network; peer membership checks do not
-authenticate callers.
-
-Membership is static. Changing `NODE_COUNT` on an existing cluster is not an
-online membership change; persisted membership validation will reject it.
-For a new disposable cluster, stop the old cluster and explicitly remove its
-volumes before choosing a new count. Removing volumes discards election history.
-Real membership changes require joint consensus when that feature is added.
+including on a follower or a node without a quorum.
 
 Logging uses `RUST_LOG`, for example `RUST_LOG=raft=debug` or
 `RUST_LOG=raft=trace`. `info` reports lifecycle and role/term/leader transitions,
 `warn` reports invalid requests and new peer outages, `debug` reports votes and
 continued failures, `trace` reports heartbeats and status reads, and `error`
-reports fatal failures. Recovered peer connectivity is logged at `info`.
-SIGINT and SIGTERM cancel the election loop and gracefully drain the servers
-with a five-second limit.
-
-The code is divided by responsibility:
-
-- [election.rs](src/election.rs): election rules and local status; no I/O.
-- [storage.rs](src/storage.rs): durable term/vote and exclusive directory access.
-- [node.rs](src/node.rs): a single state owner, timers, and bounded concurrent
-  peer calls. Each peer has at most one outgoing RPC in flight; transport
-  channels are reused and reconnect after failure.
-- [transport.rs](src/transport.rs) and [election.proto](proto/election.proto):
-  gRPC adapter and messages. Incoming requests use a bounded queue and deadlines.
-- [api.rs](src/api.rs): REST routes reading status from a watch channel.
-- [config.rs](src/config.rs) and [main.rs](src/main.rs): configuration and lifecycle.
-
-For replication, add durable log storage and load the last log index/term into
-the election state. Vote messages already include these fields, and voting uses
-the Raft log freshness comparison (last term, then index). Add AppendEntries and
-commit/application handling in the same state owner, then expose key-value and
-CAS operations through additional API routes. A leader's vote request is
-persisted before transmission; all RPC responses, including old RPCs, process
-higher terms, while old or duplicate votes cannot create a majority.
-
-Verification:
-
-```bash
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-cargo fmt --all -- --check
-docker compose config --quiet
-bash -n docker/generate-config.sh docker/entrypoint.sh
-```
-
-Tests cover vote uniqueness, term handling, split elections, strict majorities,
-stale replies, restart durability, exclusive storage, corruption, and storage
-failure. TCP/gRPC integration tests exercise stable leadership, leader failure,
-loss of quorum, restart/reconnection, invalid peer requests, single-node election,
-and REST responses. A TCP proxy test cuts both directions of an isolated
-leader's links (including existing connections), verifies majority failover,
-then restores connectivity and checks convergence to a higher term.
+reports fatal failures.

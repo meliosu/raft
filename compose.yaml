@@ -11,7 +11,7 @@ services:
     volumes:
       - config:/config
       - state:/data
-    restart: "no"
+    restart: no
 
   raft:
     build:
@@ -29,13 +29,11 @@ services:
     volumes:
       - config:/config:ro
       - state:/data
-    # Each replica receives a different host port; discover it with `compose port`.
     ports:
-      - "127.0.0.1::8080"
+      - 127.0.0.1::8080
     expose:
-      - "50051"
+      - 50051
     restart: unless-stopped
-    stop_grace_period: 10s
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8080/api/status"]
       interval: 5s
