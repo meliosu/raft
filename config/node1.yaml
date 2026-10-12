@@ -1,0 +1,15 @@
+node_id: 1
+grpc_bind: 127.0.0.1:50051
+http_bind: 127.0.0.1:8081
+data_dir: data/node-1
+heartbeat_interval_ms: 150
+election_timeout_min_ms: 750
+election_timeout_max_ms: 1500
+rpc_timeout_ms: 300
+nodes:
+  - id: 1
+    address: http://127.0.0.1:50051
+  - id: 2
+    address: http://127.0.0.1:50052
+  - id: 3
+    address: http://127.0.0.1:50053

@@ -1,0 +1,48 @@
+name: ${COMPOSE_PROJECT_NAME:-raft}
+
+services:
+  config-generator:
+    build:
+      context: .
+      target: config-generator
+    environment:
+      NODE_COUNT: ${NODE_COUNT:-3}
+      NODE_NAME_PREFIX: ${COMPOSE_PROJECT_NAME:-raft}-raft
+    volumes:
+      - config:/config
+      - state:/data
+    restart: "no"
+
+  raft:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      config-generator:
+        condition: service_completed_successfully
+    deploy:
+      replicas: ${NODE_COUNT:-3}
+    environment:
+      NODE_COUNT: ${NODE_COUNT:-3}
+      NODE_NAME_PREFIX: ${COMPOSE_PROJECT_NAME:-raft}-raft
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - config:/config:ro
+      - state:/data
+    # Each replica receives a different host port; discover it with `compose port`.
+    ports:
+      - "127.0.0.1::8080"
+    expose:
+      - "50051"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8080/api/status"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  config:
+  state:
