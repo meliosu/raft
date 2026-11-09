@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::{
-    proto::{HeartbeatRequest, HeartbeatResponse, VoteRequest, VoteResponse},
+    proto::{VoteRequest, VoteResponse},
     storage::HardState,
 };
 
@@ -18,12 +18,107 @@ pub enum Role {
     Leader,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn election() -> Election {
+        Election::new(
+            1,
+            [1, 2, 3],
+            HardState {
+                current_term: 4,
+                voted_for: None,
+            },
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn votes_compare_last_term_before_length_and_vote_once_per_term() {
+        let mut election = election();
+        election.set_log_tail(5, 3);
+        let mut req = VoteRequest {
+            term: 4,
+            candidate_id: 2,
+            last_log_index: 100,
+            last_log_term: 2,
+        };
+        assert!(!election.request_vote(&req, Instant::now()).vote_granted);
+        req.last_log_term = 3;
+        req.last_log_index = 4;
+        assert!(!election.request_vote(&req, Instant::now()).vote_granted);
+        req.last_log_term = 4;
+        req.last_log_index = 1;
+        assert!(election.request_vote(&req, Instant::now()).vote_granted);
+        assert!(election.request_vote(&req, Instant::now()).vote_granted);
+        req.candidate_id = 3;
+        assert!(!election.request_vote(&req, Instant::now()).vote_granted);
+    }
+
+    #[test]
+    fn election_advertises_real_tail_and_ignores_obsolete_votes() {
+        let mut election = election();
+        election.set_log_tail(12, 4);
+        let req = election.start_election(Instant::now()).unwrap();
+        assert_eq!((req.last_log_index, req.last_log_term), (12, 4));
+        election.vote_response(
+            2,
+            4,
+            &VoteResponse {
+                term: 4,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(election.role, Role::Candidate);
+        election.vote_response(
+            2,
+            5,
+            &VoteResponse {
+                term: 5,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(election.role, Role::Leader);
+        election.vote_response(
+            3,
+            4,
+            &VoteResponse {
+                term: 6,
+                vote_granted: false,
+            },
+        );
+        assert_eq!(election.role, Role::Follower);
+        assert_eq!(election.hard.current_term, 6);
+        assert_eq!(election.hard.voted_for, None);
+    }
+
+    #[test]
+    fn current_leader_contact_steps_down_and_resets_timer_but_stale_contact_does_not() {
+        let mut election = election();
+        election.start_election(Instant::now()).unwrap();
+        let old_deadline = election.deadline;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(!election.accept_leader(4, 2, deadline));
+        assert_eq!(election.deadline, old_deadline);
+        assert_eq!(election.role, Role::Candidate);
+        assert!(election.accept_leader(5, 2, deadline));
+        assert_eq!(election.deadline, deadline);
+        assert_eq!(election.role, Role::Follower);
+        assert_eq!(election.leader_id, Some(2));
+        assert_eq!(election.hard.voted_for, Some(1));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub node_id: u64,
     pub role: Role,
     pub current_term: u64,
     pub leader_id: Option<u64>,
+    pub last_log_index: u64,
+    pub commit_index: u64,
 }
 
 #[derive(Clone)]
@@ -35,7 +130,6 @@ pub struct Election {
     pub deadline: Instant,
     members: Arc<HashSet<u64>>,
     votes: HashSet<u64>,
-    // Extension point: load these from durable log storage when adding replication.
     last_log_index: u64,
     last_log_term: u64,
 }
@@ -64,13 +158,9 @@ impl Election {
         id != self.id && self.members.contains(&id)
     }
 
-    pub fn status(&self) -> Status {
-        Status {
-            node_id: self.id,
-            role: self.role,
-            current_term: self.hard.current_term,
-            leader_id: self.leader_id,
-        }
+    pub fn set_log_tail(&mut self, index: u64, term: u64) {
+        self.last_log_index = index;
+        self.last_log_term = term;
     }
 
     pub fn observe_term(&mut self, term: u64) {
@@ -129,20 +219,14 @@ impl Election {
         }
     }
 
-    pub fn heartbeat(
-        &mut self,
-        request: &HeartbeatRequest,
-        deadline: Instant,
-    ) -> HeartbeatResponse {
-        self.observe_term(request.term);
-        let accepted = request.term == self.hard.current_term;
-        if accepted {
-            self.follow(Some(request.leader_id));
+    pub fn accept_leader(&mut self, term: u64, leader_id: u64, deadline: Instant) -> bool {
+        self.observe_term(term);
+        if term == self.hard.current_term {
+            self.follow(Some(leader_id));
             self.deadline = deadline;
-        }
-        HeartbeatResponse {
-            term: self.hard.current_term,
-            accepted,
+            true
+        } else {
+            false
         }
     }
 

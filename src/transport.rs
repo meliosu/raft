@@ -9,7 +9,8 @@ use tonic::{Request, Response, Status};
 use crate::{
     node::Inbound,
     proto::{
-        HeartbeatRequest, HeartbeatResponse, VoteRequest, VoteResponse, election_server::Election,
+        AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse,
+        election_server::Election,
     },
 };
 
@@ -33,14 +34,14 @@ impl ElectionService {
             self.sender
                 .send(event)
                 .await
-                .map_err(|_| Status::unavailable("election task stopped"))?;
+                .map_err(|_| Status::unavailable("Raft task stopped"))?;
             receiver
                 .await
-                .map_err(|_| Status::unavailable("election task stopped"))?
+                .map_err(|_| Status::unavailable("Raft task stopped"))?
                 .map(Response::new)
         })
         .await
-        .map_err(|_| Status::deadline_exceeded("election task busy"))?
+        .map_err(|_| Status::deadline_exceeded("Raft task busy"))?
     }
 }
 
@@ -55,12 +56,12 @@ impl Election for ElectionService {
             .await
     }
 
-    async fn heartbeat(
+    async fn append_entries(
         &self,
-        request: Request<HeartbeatRequest>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
+        request: Request<AppendEntriesRequest>,
+    ) -> Result<Response<AppendEntriesResponse>, Status> {
         let (reply, receiver) = oneshot::channel();
-        self.dispatch(Inbound::Heartbeat(request.into_inner(), reply), receiver)
+        self.dispatch(Inbound::Append(request.into_inner(), reply), receiver)
             .await
     }
 }

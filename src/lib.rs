@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod election;
 pub mod node;
+pub mod replication;
 pub mod storage;
 pub mod transport;
 

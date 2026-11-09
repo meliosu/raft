@@ -5,14 +5,14 @@ use clap::Parser;
 use log::{error, info};
 use raft::{
     api, config::Config, node::Node, proto::election_server::ElectionServer,
-    transport::ElectionService,
+    replication::MAX_RPC_BYTES, transport::ElectionService,
 };
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
-#[command(version, about = "Raft leader election node")]
+#[command(version, about = "Raft replicated log node")]
 struct Args {
     #[arg(long, env = "RAFT_CONFIG_PATH", default_value = "config.yaml")]
     config: PathBuf,
@@ -57,9 +57,9 @@ async fn run() -> Result<()> {
     let mut tasks = JoinSet::new();
     let token = shutdown.clone();
     tasks.spawn(async move { node.run(token).await });
-    let service = ElectionServer::new(ElectionService::new(sender, config.rpc_timeout()))
-        .max_decoding_message_size(4096)
-        .max_encoding_message_size(4096);
+    let service = ElectionServer::new(ElectionService::new(sender.clone(), config.rpc_timeout()))
+        .max_decoding_message_size(MAX_RPC_BYTES)
+        .max_encoding_message_size(MAX_RPC_BYTES);
     let token = shutdown.clone();
     tasks.spawn(async move {
         tonic::transport::Server::builder()
@@ -74,7 +74,7 @@ async fn run() -> Result<()> {
     });
     let token = shutdown.clone();
     tasks.spawn(async move {
-        axum::serve(http_listener, api::router(status))
+        axum::serve(http_listener, api::router(status, sender))
             .with_graceful_shutdown(token.cancelled_owned())
             .await
             .context("HTTP server")

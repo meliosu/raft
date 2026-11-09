@@ -1,13 +1,16 @@
-# Raft elections in Rust
+# Raft replicated log in Rust
 
-An election-only Raft node using Tokio, tonic/prost gRPC, Axum, and
+A small Raft node using Tokio, tonic/prost gRPC, Axum, and
 `log`/`env_logger`. The cluster has fixed membership. Each node starts as a
 follower, uses a randomized election timeout, votes once per term, and becomes
 leader after receiving a strict majority of the configured members' votes.
 
-The gRPC service has `RequestVote` and a small `Heartbeat` RPC. The latter keeps
-followers from starting new elections and reports the leader ID. It carries no
-log information.
+The gRPC service has `RequestVote` and `AppendEntries`. Empty AppendEntries
+requests serve as heartbeats; nonempty requests replicate JSON commands. Logs,
+terms, and votes survive restarts. This is a replicated log, not an application
+state machine: commands are committed but are not executed. Snapshots, log
+compaction, membership changes, client deduplication, and linearizable reads are
+not implemented. The log is retained in memory and the journal grows on disk.
 
 Run locally with Rust 1.88 or newer (a vendored `protoc` is used automatically):
 
@@ -20,14 +23,16 @@ RUST_LOG=info ./target/debug/raft --config config/node3.yaml
 curl http://127.0.0.1:8081/api/status
 ```
 
-The single REST endpoint, `GET /api/status`, returns a local snapshot:
+`GET /api/status` returns a local snapshot:
 
 ```json
 {
     "node_id": 1,
     "role": "follower",
     "current_term": 4,
-    "leader_id": 2
+    "leader_id": 2,
+    "last_log_index": 12,
+    "commit_index": 10
 }
 ```
 
@@ -35,6 +40,67 @@ Roles are `follower`, `candidate`, or `leader`. `leader_id` is `null` until the
 node wins an election or hears a current leader's heartbeat. This status is
 local knowledge: during a partition an isolated old leader can still report
 `leader` while the majority elects a leader in a higher term.
+
+## Submitting and inspecting logs
+
+Submit a JSON command to the leader's HTTP port:
+
+```bash
+curl -i http://127.0.0.1:8082/api/logs \
+  -H 'Content-Type: application/json' \
+  -d '{"command":{"operation":"set","key":"hello","value":"world"}}'
+# HTTP 201: {"index":13,"term":4}
+```
+
+`POST /api/logs` returns **201 only after the entry is durably replicated to a
+strict majority and committed**. A follower returns **409** with
+`{"error":"not_leader","leader_id":2}` (or a null leader ID). There is no
+automatic forwarding. If leadership is lost or the five-second wait expires,
+**504** with `error: "outcome_unknown"` means the entry **may still commit**.
+Retrying can produce duplicate commands. **503** indicates a busy or unavailable
+node; **400** rejects invalid command size/depth or pagination. Malformed JSON
+uses Axum's validation errors; oversized HTTP bodies return **413**.
+
+Commands may be any JSON value, including `null`, and are limited to 16 KiB of
+compact JSON and 64 nesting levels. HTTP request bodies are limited to 17 KiB,
+including the command wrapper and whitespace. At most 128 client proposals can
+wait for commitment on a node.
+
+Inspect each node independently, including followers:
+
+```bash
+curl 'http://127.0.0.1:8081/api/logs?from=1&limit=100'
+curl 'http://127.0.0.1:8082/api/logs?from=1&limit=100'
+curl 'http://127.0.0.1:8083/api/logs?from=1&limit=100'
+```
+
+Example response:
+
+```json
+{
+    "node_id": 1,
+    "current_term": 4,
+    "commit_index": 2,
+    "last_log_index": 3,
+    "entries": [
+        {"index":1,"term":4,"kind":"noop","command":null,"committed":true},
+        {"index":2,"term":4,"kind":"command","command":{"key":"hello"},"committed":true},
+        {"index":3,"term":4,"kind":"command","command":null,"committed":false}
+    ],
+    "next_index": null
+}
+```
+
+Indexes start at 1. `from` defaults to 1; `limit` defaults to 100 and must be
+between 1 and 100. Follow `next_index` for another page; it is null at the local
+tail. Each page is a consistent local snapshot, but pages are not a stable
+cross-request snapshot: uncommitted suffixes can be replaced. A no-op is appended
+on every election to commit entries inherited from prior leaders. `kind`
+distinguishes no-ops from client `null` commands. These inspection endpoints
+are **not linearizable reads**; followers can lag. After restart `commit_index`
+starts at zero and is recovered through leader communication/replication.
+
+## Configuration and durability
 
 YAML configuration contains all members, **including the local node**. Example:
 
@@ -74,6 +140,23 @@ concurrent use. Corruption, mismatched identity/membership, and persistence
 failure stop the node instead of resetting its voting history. Preserve this
 directory across restarts, including container replacement.
 
+`log.journal` stores checksummed, length-framed suffix mutations. Appending a
+replacement suffix is one frame, so interrupted writes never expose only its
+truncation. Each accepted batch is synced before acknowledging AppendEntries;
+the leader also syncs its local entries before counting them toward a quorum.
+Recovery discards only an incomplete trailing frame and rejects complete corrupt
+frames. Existing election-only directories are accepted as empty logs while
+preserving their terms and votes. Preserve **both** files; do not edit or remove
+durable state. Storage errors stop the node rather than acknowledging unsafe
+writes.
+
+Replication reuses connections, bounds requests to 64 entries and approximately
+128 KiB, and permits one outstanding RPC per peer. Conflict-term hints accelerate
+catch-up. Request/response sizes are capped at 256 KiB. Membership is trusted;
+there is no authentication or TLS, so use a private network. The RPC change
+replaces Heartbeat rather than supporting rolling upgrades from election-only
+nodes: upgrade all nodes together.
+
 Start a Docker cluster with modern Docker Compose v2 or newer:
 
 ```bash
@@ -108,3 +191,15 @@ Logging uses `RUST_LOG`, for example `RUST_LOG=raft=debug` or
 `warn` reports invalid requests and new peer outages, `debug` reports votes and
 continued failures, `trace` reports heartbeats and status reads, and `error`
 reports fatal failures.
+
+## Tests
+
+```bash
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+Tests cover log matching, current-term majority commitment, stale responses,
+single-node operation, interrupted writes/corruption, REST validation, follower
+catch-up, leader replacement, divergent suffix repair, and cluster restarts.
