@@ -20,6 +20,9 @@ struct Args {
     node_id: Option<u64>,
     #[arg(long, env = "RAFT_DATA_DIR")]
     data_dir: Option<PathBuf>,
+    /// Keep Raft state only in memory; unsafe to restart an existing member.
+    #[arg(long)]
+    in_memory: bool,
 }
 
 #[tokio::main]
@@ -52,7 +55,11 @@ async fn run() -> Result<()> {
     let http_listener = TcpListener::bind(config.http_bind)
         .await
         .context("binding HTTP listener")?;
-    let (node, sender, status) = Node::new(config.clone()).await?;
+    let (node, sender, status) = if args.in_memory {
+        Node::new_in_memory(config.clone()).await?
+    } else {
+        Node::new(config.clone()).await?
+    };
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
     let token = shutdown.clone();
@@ -85,7 +92,11 @@ async fn run() -> Result<()> {
         config.grpc_bind,
         config.http_bind,
         config.nodes.len(),
-        config.data_dir.display()
+        if args.in_memory {
+            "<in-memory>".to_owned()
+        } else {
+            config.data_dir.display().to_string()
+        }
     );
     let first = tokio::select! {
         signal = shutdown_signal() => signal,
@@ -121,4 +132,33 @@ async fn shutdown_signal() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("shutdown requested");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_persistence_is_the_default() {
+        assert!(!Args::try_parse_from(["raft"]).unwrap().in_memory);
+    }
+
+    #[test]
+    fn in_memory_flag_preserves_config_and_other_overrides() {
+        let args = Args::try_parse_from([
+            "raft",
+            "--in-memory",
+            "--config",
+            "custom.yaml",
+            "--node-id",
+            "2",
+            "--data-dir",
+            "ignored",
+        ])
+        .unwrap();
+        assert!(args.in_memory);
+        assert_eq!(args.config, PathBuf::from("custom.yaml"));
+        assert_eq!(args.node_id, Some(2));
+        assert_eq!(args.data_dir, Some(PathBuf::from("ignored")));
+    }
 }

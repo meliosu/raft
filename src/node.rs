@@ -1,5 +1,5 @@
 //! One task owns all Raft state. Network I/O is concurrent and bounded per peer;
-//! durable mutations are serialized on the blocking pool before acknowledgement.
+//! When enabled, durable mutations run on the blocking pool before acknowledgement.
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -26,7 +26,7 @@ use crate::{
         election_client::ElectionClient,
     },
     replication::{Entry, MAX_PAGE_ENTRIES, MAX_RPC_BYTES, ReplicatedLog, validate_command},
-    storage::Storage,
+    storage::{HardState, Storage},
 };
 
 const MAX_PENDING: usize = 128;
@@ -119,7 +119,9 @@ pub struct Node {
     config: Config,
     election: Election,
     log: ReplicatedLog,
-    storage: Arc<Storage>,
+    // The live term/vote/log always belong to this task. None disables only
+    // disk persistence, without introducing a second in-memory copy of state.
+    storage: Option<Arc<Storage>>,
     inbound: mpsc::Receiver<Inbound>,
     status: watch::Sender<Status>,
     clients: HashMap<u64, ElectionClient<tonic::transport::Channel>>,
@@ -136,14 +138,38 @@ impl Node {
     pub async fn new(
         config: Config,
     ) -> Result<(Self, mpsc::Sender<Inbound>, watch::Receiver<Status>)> {
+        Self::initialize(config, false).await
+    }
+
+    /// Start with empty, volatile state and never access the data directory.
+    /// Losing terms/votes on restart violates Raft's crash-recovery assumptions;
+    /// use this only for disposable clusters, not durable membership.
+    pub async fn new_in_memory(
+        config: Config,
+    ) -> Result<(Self, mpsc::Sender<Inbound>, watch::Receiver<Status>)> {
+        Self::initialize(config, true).await
+    }
+
+    async fn initialize(
+        config: Config,
+        in_memory: bool,
+    ) -> Result<(Self, mpsc::Sender<Inbound>, watch::Receiver<Status>)> {
         config.validate()?;
         let id = config.id();
         let members: Vec<_> = config.nodes.iter().map(|node| node.id).collect();
-        let dir = config.data_dir.clone();
-        let persisted_members = members.clone();
-        let (storage, hard, log) =
-            tokio::task::spawn_blocking(move || Storage::open(dir, id, persisted_members))
-                .await??;
+        let (storage, hard, log) = if in_memory {
+            warn!(
+                "node={id} running in memory: state is lost on exit; restarting an existing member is unsafe"
+            );
+            (None, HardState::default(), ReplicatedLog::default())
+        } else {
+            let dir = config.data_dir.clone();
+            let persisted_members = members.clone();
+            let (storage, hard, log) =
+                tokio::task::spawn_blocking(move || Storage::open(dir, id, persisted_members))
+                    .await??;
+            (Some(Arc::new(storage)), hard, log)
+        };
         let mut election = Election::new(id, members, hard, Self::deadline(&config));
         election.set_log_tail(log.last_index(), log.term(log.last_index()).unwrap());
         info!(
@@ -173,7 +199,7 @@ impl Node {
                 config,
                 election,
                 log,
-                storage: Arc::new(storage),
+                storage,
                 inbound,
                 status,
                 clients,
@@ -212,8 +238,10 @@ impl Node {
         if self.election.role == Role::Leader && next.role != Role::Leader {
             next.deadline = Self::deadline(&self.config);
         }
-        if next.hard != self.election.hard {
-            let storage = Arc::clone(&self.storage);
+        if next.hard != self.election.hard
+            && let Some(storage) = &self.storage
+        {
+            let storage = Arc::clone(storage);
             let hard = next.hard.clone();
             tokio::task::spawn_blocking(move || storage.save(&hard))
                 .await?
@@ -223,16 +251,18 @@ impl Node {
         Ok(())
     }
 
-    async fn persist_entries(&mut self, from: u64, entries: Vec<Entry>) -> Result<()> {
-        let storage = Arc::clone(&self.storage);
-        // Move the bounded batch into the blocking job and return it, avoiding
-        // a second clone of command payloads while the filesystem is syncing.
-        let entries = tokio::task::spawn_blocking(move || {
-            storage.append(from, &entries)?;
-            Ok::<_, anyhow::Error>(entries)
-        })
-        .await?
-        .context("persisting log; node must stop on storage failure")?;
+    /// Update the live suffix only after any configured disk write succeeds.
+    async fn replace_log_suffix(&mut self, from: u64, mut entries: Vec<Entry>) -> Result<()> {
+        if let Some(storage) = &self.storage {
+            let storage = Arc::clone(storage);
+            // Return the batch from the blocking job instead of cloning it.
+            entries = tokio::task::spawn_blocking(move || {
+                storage.append(from, &entries)?;
+                Ok::<_, anyhow::Error>(entries)
+            })
+            .await?
+            .context("persisting log; node must stop on storage failure")?;
+        }
         self.log.replace(from, entries)?;
         self.election.set_log_tail(
             self.log.last_index(),
@@ -364,7 +394,7 @@ impl Node {
                     plan.response.success
                 );
                 if let Some((from, entries)) = plan.mutation {
-                    self.persist_entries(from, entries).await?;
+                    self.replace_log_suffix(from, entries).await?;
                 }
                 self.log.commit_index = plan.commit_index;
                 let _ = reply.send(Ok(plan.response));
@@ -389,7 +419,7 @@ impl Node {
                         .filter(|i| *i < u64::MAX)
                         .context("log index exhausted")?;
                     let term = self.election.hard.current_term;
-                    self.persist_entries(
+                    self.replace_log_suffix(
                         index,
                         vec![Entry {
                             term,
@@ -513,58 +543,78 @@ impl Node {
         Ok(())
     }
 
-    /// Called after every event. Never send empty RPCs in response to empty RPC
-    /// successes: only new entries, new commit knowledge, or the timer trigger work.
+    /// Keep state transitions, client replies, status, and replication in order.
     async fn maintain(&mut self) -> Result<()> {
         if self.election.role == Role::Leader {
-            if self.leader_term != Some(self.election.hard.current_term) {
-                self.leader_term = Some(self.election.hard.current_term);
-                self.progress = self
-                    .clients
-                    .keys()
-                    .map(|&id| {
-                        (
-                            id,
-                            Progress {
-                                next_index: self.log.last_index() + 1,
-                                match_index: 0,
-                                ack_commit: 0,
-                                retry_at: Instant::now(),
-                            },
-                        )
-                    })
-                    .collect();
-                let index = self
-                    .log
-                    .last_index()
-                    .checked_add(1)
-                    .filter(|i| *i < u64::MAX)
-                    .context("log index exhausted")?;
-                self.persist_entries(
-                    index,
-                    vec![Entry {
-                        term: self.election.hard.current_term,
-                        command: None,
-                    }],
-                )
-                .await?;
-                self.next_heartbeat = Instant::now();
-            }
-            let mut matched: Vec<_> = self.progress.values().map(|p| p.match_index).collect();
-            matched.push(self.log.last_index());
-            matched.sort_unstable();
-            let majority = matched.len() / 2 + 1;
-            let candidate = matched[matched.len() - majority];
-            if candidate > self.log.commit_index
-                && self.log.term(candidate) == Some(self.election.hard.current_term)
-            {
-                self.log.commit_index = candidate;
-            }
+            self.initialize_leader().await?;
+            self.advance_commit();
         } else {
             self.leader_term = None;
             self.progress.clear();
         }
+        self.resolve_proposals();
+        self.publish_status();
+        if self.election.role == Role::Leader {
+            self.replicate()?;
+        }
+        Ok(())
+    }
 
+    async fn initialize_leader(&mut self) -> Result<()> {
+        let term = self.election.hard.current_term;
+        if self.leader_term == Some(term) {
+            return Ok(());
+        }
+        self.leader_term = Some(term);
+        self.progress = self
+            .clients
+            .keys()
+            .map(|&id| {
+                (
+                    id,
+                    Progress {
+                        next_index: self.log.last_index() + 1,
+                        match_index: 0,
+                        ack_commit: 0,
+                        retry_at: Instant::now(),
+                    },
+                )
+            })
+            .collect();
+        let index = self
+            .log
+            .last_index()
+            .checked_add(1)
+            .filter(|i| *i < u64::MAX)
+            .context("log index exhausted")?;
+        // A current-term no-op lets the new leader commit inherited entries.
+        self.replace_log_suffix(
+            index,
+            vec![Entry {
+                term,
+                command: None,
+            }],
+        )
+        .await?;
+        self.next_heartbeat = Instant::now();
+        Ok(())
+    }
+
+    fn advance_commit(&mut self) {
+        let mut matched: Vec<_> = self.progress.values().map(|p| p.match_index).collect();
+        matched.push(self.log.last_index());
+        matched.sort_unstable();
+        let majority = matched.len() / 2 + 1;
+        let candidate = matched[matched.len() - majority];
+        // Raft only directly commits entries from the leader's current term.
+        if candidate > self.log.commit_index
+            && self.log.term(candidate) == Some(self.election.hard.current_term)
+        {
+            self.log.commit_index = candidate;
+        }
+    }
+
+    fn resolve_proposals(&mut self) {
         let mut waiting = Vec::new();
         for pending in self.pending.drain(..) {
             if pending.reply.is_closed() {
@@ -586,7 +636,9 @@ impl Node {
             }
         }
         self.pending = waiting;
+    }
 
+    fn publish_status(&self) {
         let snapshot = Self::snapshot(&self.election, &self.log);
         let before = self.status.borrow().clone();
         if before != snapshot {
@@ -605,40 +657,42 @@ impl Node {
             }
             self.status.send_replace(snapshot);
         }
-        if self.election.role == Role::Leader {
-            let now = Instant::now();
-            let heartbeat = now >= self.next_heartbeat;
-            if heartbeat {
-                self.next_heartbeat =
-                    now + Duration::from_millis(self.config.heartbeat_interval_ms);
+    }
+
+    /// Empty RPC successes must not cause an empty-RPC loop. Send only for new
+    /// entries, new commit knowledge, or a heartbeat timer expiration.
+    fn replicate(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let heartbeat = now >= self.next_heartbeat;
+        if heartbeat {
+            self.next_heartbeat = now + Duration::from_millis(self.config.heartbeat_interval_ms);
+        }
+        let peers: Vec<_> = self.progress.keys().copied().collect();
+        for peer in peers {
+            let progress = &self.progress[&peer];
+            if self.in_flight.contains(&peer) || now < progress.retry_at {
+                continue;
             }
-            let peers: Vec<_> = self.progress.keys().copied().collect();
-            for peer in peers {
-                let progress = &self.progress[&peer];
-                if self.in_flight.contains(&peer) || now < progress.retry_at {
-                    continue;
-                }
-                if !heartbeat
-                    && progress.next_index > self.log.last_index()
-                    && progress.ack_commit >= self.log.commit_index
-                {
-                    continue;
-                }
-                let prev_log_index = progress.next_index - 1;
-                ensure!(
-                    prev_log_index <= self.log.last_index(),
-                    "replication progress exceeds log tail"
-                );
-                let request = AppendEntriesRequest {
-                    term: self.election.hard.current_term,
-                    leader_id: self.election.id,
-                    prev_log_index,
-                    prev_log_term: self.log.term(prev_log_index).unwrap(),
-                    entries: self.log.batch(progress.next_index),
-                    leader_commit: self.log.commit_index,
-                };
-                self.send(peer, Outbound::Append(request));
+            if !heartbeat
+                && progress.next_index > self.log.last_index()
+                && progress.ack_commit >= self.log.commit_index
+            {
+                continue;
             }
+            let prev_log_index = progress.next_index - 1;
+            ensure!(
+                prev_log_index <= self.log.last_index(),
+                "replication progress exceeds log tail"
+            );
+            let request = AppendEntriesRequest {
+                term: self.election.hard.current_term,
+                leader_id: self.election.id,
+                prev_log_index,
+                prev_log_term: self.log.term(prev_log_index).unwrap(),
+                entries: self.log.batch(progress.next_index),
+                leader_commit: self.log.commit_index,
+            };
+            self.send(peer, Outbound::Append(request));
         }
         Ok(())
     }
@@ -688,11 +742,10 @@ mod tests {
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
 
-    async fn node(count: u64) -> (TempDir, Node, watch::Receiver<Status>) {
-        let dir = tempdir().unwrap();
-        let config = Config {
+    fn config(count: u64, data_dir: std::path::PathBuf) -> Config {
+        Config {
             node_id: Some(1),
-            data_dir: dir.path().into(),
+            data_dir,
             nodes: (1..=count)
                 .map(|id| Peer {
                     id,
@@ -700,8 +753,12 @@ mod tests {
                 })
                 .collect(),
             ..Config::default()
-        };
-        let (node, _, status) = Node::new(config).await.unwrap();
+        }
+    }
+
+    async fn node(count: u64) -> (TempDir, Node, watch::Receiver<Status>) {
+        let dir = tempdir().unwrap();
+        let (node, _, status) = Node::new(config(count, dir.path().into())).await.unwrap();
         (dir, node, status)
     }
 
@@ -752,7 +809,7 @@ mod tests {
         let mut next = node.election.clone();
         next.observe_term(1);
         node.commit_election(next).await.unwrap();
-        node.persist_entries(
+        node.replace_log_suffix(
             1,
             vec![Entry {
                 term: 1,
@@ -802,7 +859,7 @@ mod tests {
         let (_dir, mut node, _) = node(3).await;
         become_leader(&mut node).await;
         let term = node.election.hard.current_term;
-        node.persist_entries(
+        node.replace_log_suffix(
             2,
             vec![Entry {
                 term,
@@ -971,7 +1028,7 @@ mod tests {
         let mut next = node.election.clone();
         next.observe_term(3);
         node.commit_election(next).await.unwrap();
-        node.persist_entries(
+        node.replace_log_suffix(
             1,
             [1, 2, 2, 3]
                 .into_iter()
@@ -1002,5 +1059,123 @@ mod tests {
         .unwrap();
         assert_eq!(node.progress[&2].next_index, 4);
         assert_eq!(node.progress[&2].match_index, 0);
+    }
+
+    #[tokio::test]
+    async fn in_memory_votes_replication_and_proposals_never_create_state_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unused/nested/state");
+        let config = config(3, path.clone());
+        let (mut node, _sender, status) = Node::new_in_memory(config.clone()).await.unwrap();
+        assert!(node.storage.is_none());
+        for (candidate_id, granted) in [(2, true), (3, false)] {
+            let (tx, rx) = oneshot::channel();
+            node.handle_inbound(Inbound::Vote(
+                VoteRequest {
+                    term: 2,
+                    candidate_id,
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
+                tx,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(rx.await.unwrap().unwrap().vote_granted, granted);
+        }
+        let (tx, rx) = oneshot::channel();
+        node.handle_inbound(Inbound::Append(
+            AppendEntriesRequest {
+                term: 3,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    Entry {
+                        term: 3,
+                        command: Some(Value::Null),
+                    }
+                    .wire(),
+                ],
+                leader_commit: 1,
+            },
+            tx,
+        ))
+        .await
+        .unwrap();
+        assert!(rx.await.unwrap().unwrap().success);
+        assert_eq!(node.log.entry(1).unwrap().command, Some(Value::Null));
+        become_leader(&mut node).await;
+        let (tx, mut rx) = oneshot::channel();
+        node.handle_inbound(Inbound::Propose(json!("memory proposal"), tx))
+            .await
+            .unwrap();
+        node.maintain().await.unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        node.handle_completion(completion(2, 4, 3, 4, true))
+            .await
+            .unwrap();
+        node.maintain().await.unwrap();
+        assert_eq!(rx.await.unwrap().unwrap().index, 3);
+        assert_eq!(status.borrow().commit_index, 3);
+        assert!(!dir.path().join("unused").exists());
+
+        drop(node);
+        let (fresh, _, status) = Node::new_in_memory(config).await.unwrap();
+        assert_eq!(fresh.election.hard, HardState::default());
+        assert_eq!(status.borrow().last_log_index, 0);
+        assert_eq!(status.borrow().commit_index, 0);
+        assert!(!dir.path().join("unused").exists());
+    }
+
+    #[tokio::test]
+    async fn in_memory_ignores_locked_existing_state_without_modifying_it() {
+        let (dir, mut disk, _) = node(3).await;
+        let mut next = disk.election.clone();
+        next.observe_term(7);
+        disk.commit_election(next).await.unwrap();
+        disk.replace_log_suffix(
+            1,
+            vec![Entry {
+                term: 7,
+                command: Some(json!("on disk")),
+            }],
+        )
+        .await
+        .unwrap();
+        let hard = std::fs::read(dir.path().join("hard-state.json")).unwrap();
+        let log = std::fs::read(dir.path().join("log.journal")).unwrap();
+
+        // The durable node still holds its directory lock. A volatile node must
+        // neither try to acquire that lock nor load its term or log.
+        let (mut memory, _, status) = Node::new_in_memory(disk.config.clone()).await.unwrap();
+        assert_eq!(status.borrow().current_term, 0);
+        assert_eq!(status.borrow().last_log_index, 0);
+        become_leader(&mut memory).await;
+        assert_eq!(memory.election.hard.current_term, 1);
+        assert_eq!(
+            std::fs::read(dir.path().join("hard-state.json")).unwrap(),
+            hard
+        );
+        assert_eq!(std::fs::read(dir.path().join("log.journal")).unwrap(), log);
+    }
+
+    #[tokio::test]
+    async fn in_memory_accepts_a_data_path_that_is_not_a_directory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-a-directory");
+        std::fs::write(&path, b"untouched").unwrap();
+        let (mut node, _, _) = Node::new_in_memory(config(1, path.clone())).await.unwrap();
+        become_leader(&mut node).await;
+        let (tx, rx) = oneshot::channel();
+        node.handle_inbound(Inbound::Propose(json!("test"), tx))
+            .await
+            .unwrap();
+        node.maintain().await.unwrap();
+        assert_eq!(rx.await.unwrap().unwrap().index, 2);
+        assert_eq!(std::fs::read(path).unwrap(), b"untouched");
     }
 }

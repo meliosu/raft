@@ -7,10 +7,11 @@ leader after receiving a strict majority of the configured members' votes.
 
 The gRPC service has `RequestVote` and `AppendEntries`. Empty AppendEntries
 requests serve as heartbeats; nonempty requests replicate JSON commands. Logs,
-terms, and votes survive restarts. This is a replicated log, not an application
-state machine: commands are committed but are not executed. Snapshots, log
-compaction, membership changes, client deduplication, and linearizable reads are
-not implemented. The log is retained in memory and the journal grows on disk.
+terms, and votes survive restarts by default. This is a replicated log, not an
+application state machine: commands are committed but are not executed.
+Snapshots, log compaction, membership changes, client deduplication, and
+linearizable reads are not implemented. The entire log is retained in memory;
+in disk-backed mode, the journal also grows on disk.
 
 Run locally with Rust 1.88 or newer (a vendored `protoc` is used automatically):
 
@@ -22,6 +23,26 @@ RUST_LOG=info ./target/debug/raft --config config/node2.yaml
 RUST_LOG=info ./target/debug/raft --config config/node3.yaml
 curl http://127.0.0.1:8081/api/status
 ```
+
+For a disposable, **in-memory** node:
+
+```bash
+./target/debug/raft --config config/node1.yaml --in-memory
+```
+
+The YAML configuration is still read from disk and validated. `--in-memory`
+starts with term zero, no vote, and an empty log. It never reads, creates, locks,
+or writes the state directory; `data_dir`/`--data-dir` is ignored, even if it
+contains existing state. Term, vote, and log updates stay in memory without
+blocking filesystem work. Elections, replication, quorum requirements, and REST
+endpoints otherwise behave the same.
+
+**Use this only for fresh, disposable clusters.** All state is lost on exit.
+Restarting a volatile node as an existing member can violate Raft safety: it can
+vote twice in a term or lose acknowledged entries. Do not use this mode as a
+replacement for a durable member or rely on mixed clusters for durability.
+There is no directory lock to prevent concurrent processes using the same ID.
+Normal disk persistence remains the default when the flag is absent.
 
 `GET /api/status` returns a local snapshot:
 
@@ -52,8 +73,10 @@ curl -i http://127.0.0.1:8082/api/logs \
 # HTTP 201: {"index":13,"term":4}
 ```
 
-`POST /api/logs` returns **201 only after the entry is durably replicated to a
-strict majority and committed**. A follower returns **409** with
+`POST /api/logs` returns **201 only after the entry is replicated to a strict
+majority and committed**. Replicas sync to disk in the default mode; in-memory
+replicas acknowledge volatile storage instead, so 201 does not imply durability
+when using them. A follower returns **409** with
 `{"error":"not_leader","leader_id":2}` (or a null leader ID). There is no
 automatic forwarding. If leadership is lost or the five-second wait expires,
 **504** with `error: "outcome_unknown"` means the entry **may still commit**.
@@ -101,6 +124,8 @@ are **not linearizable reads**; followers can lag. After restart `commit_index`
 starts at zero and is recovered through leader communication/replication.
 
 ## Configuration and durability
+
+The filesystem guarantees below apply to the default, disk-backed mode.
 
 YAML configuration contains all members, **including the local node**. Example:
 
@@ -203,3 +228,5 @@ cargo fmt --all --check
 Tests cover log matching, current-term majority commitment, stale responses,
 single-node operation, interrupted writes/corruption, REST validation, follower
 catch-up, leader replacement, divergent suffix repair, and cluster restarts.
+In-memory tests cover RPCs, commitment, partition healing, fresh state on
+recreation, and leaving missing, locked, or unusable state paths untouched.

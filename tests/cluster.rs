@@ -1,4 +1,4 @@
-//! Real tonic transport, real durable directories, and independently restarted nodes.
+//! Real tonic transport with durable or volatile nodes and controllable partitions.
 use std::{
     sync::{
         Arc,
@@ -85,10 +85,15 @@ struct Cluster {
     configs: Vec<Config>,
     running: Vec<Option<Running>>,
     partition: Arc<AtomicU64>,
+    in_memory: bool,
 }
 
 impl Cluster {
     async fn new(count: usize) -> Self {
+        Self::with_memory(count, false).await
+    }
+
+    async fn with_memory(count: usize, in_memory: bool) -> Self {
         let dir = tempdir().unwrap();
         let mut listeners = Vec::new();
         for _ in 0..count {
@@ -122,6 +127,7 @@ impl Cluster {
             configs,
             running: (0..count).map(|_| None).collect(),
             partition: Arc::new(AtomicU64::new(0)),
+            in_memory,
         };
         for (i, listener) in listeners.into_iter().enumerate() {
             cluster.start_with(i, listener).await;
@@ -130,7 +136,13 @@ impl Cluster {
     }
 
     async fn start_with(&mut self, i: usize, listener: TcpListener) {
-        let (node, sender, status) = Node::new(self.configs[i].clone()).await.unwrap();
+        let config = self.configs[i].clone();
+        let (node, sender, status) = if self.in_memory {
+            Node::new_in_memory(config).await
+        } else {
+            Node::new(config).await
+        }
+        .unwrap();
         let token = CancellationToken::new();
         let mut tasks = JoinSet::new();
         let child = token.clone();
@@ -317,7 +329,16 @@ async fn replicates_batches_catches_up_offline_follower_and_recovers_cluster() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_quorum_never_succeeds_and_new_leader_repairs_divergent_suffix() {
-    let mut cluster = Cluster::new(3).await;
+    check_partition_recovery(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_memory_cluster_replicates_and_heals_partitions_without_state_files() {
+    check_partition_recovery(true).await;
+}
+
+async fn check_partition_recovery(in_memory: bool) {
+    let mut cluster = Cluster::with_memory(3, in_memory).await;
     let old = cluster.leader().await;
     let base = cluster.propose(old, json!("committed prefix")).await;
     cluster.caught_up(base.index).await;
@@ -375,6 +396,9 @@ async fn no_quorum_never_succeeds_and_new_leader_repairs_divergent_suffix() {
         );
     }
     cluster.shutdown().await;
+    if in_memory {
+        assert_eq!(std::fs::read_dir(cluster._dir.path()).unwrap().count(), 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
