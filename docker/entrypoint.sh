@@ -20,7 +20,11 @@ for (( attempt=0; attempt<30; attempt++ )); do
             for own_ip in "${own_ips[@]}"; do
                 if [[ $address == "$own_ip" ]]; then
                     echo "Starting node $id (${NODE_NAME_PREFIX}-${id})"
-                    exec raft "$@" --node-id "$id" --data-dir "/data/node-$id"
+                    if [[ $IN_MEMORY ]]; then
+                        exec raft "$@" --node-id "$id" --in-memory
+                    else
+                        exec raft "$@" --node-id "$id" --data-dir "/data/node-$id"
+                    fi
                 fi
             done
         done < <(getent ahostsv4 "${NODE_NAME_PREFIX}-${id}" || true)

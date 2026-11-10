@@ -26,6 +26,7 @@ services:
       NODE_COUNT: ${NODE_COUNT:-3}
       NODE_NAME_PREFIX: ${COMPOSE_PROJECT_NAME:-raft}-raft
       RUST_LOG: ${RUST_LOG:-info}
+      IN_MEMORY: ${IN_MEMORY:-}
     volumes:
       - config:/config:ro
       - state:/data
